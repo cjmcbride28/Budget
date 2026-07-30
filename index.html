@@ -686,6 +686,10 @@
 
   :focus-visible{ outline:2px solid var(--brass); outline-offset:2px; }
 </style>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
 </head>
 <body>
 
@@ -697,6 +701,7 @@
       <label for="monthInput">Viewing</label>
       <input type="month" id="monthInput">
     </div>
+    <button class="ghost" id="openAccountModal">👤 Account</button>
     <button class="ghost" id="installBtn">⭳ Install app</button>
   </div>
 </header>
@@ -730,6 +735,8 @@
     <button class="income-btn" id="openIncomeModal">+ Log income</button>
   </div>
   <div class="toolbar-right">
+    <button class="ghost" id="openSummaryModal">📊 Summarize</button>
+    <button class="ghost" id="exportExcelBtn">⬇ Export Excel</button>
     <button class="ghost" id="openCategoryModal">+ New category</button>
     <button class="ghost" id="openRecurringModal">↻ Recurring</button>
   </div>
@@ -956,6 +963,64 @@
   </div>
 </div>
 
+<!-- Summarize Modal -->
+<div class="overlay" id="summaryOverlay">
+  <div class="modal">
+    <h2>Spending summary</h2>
+    <div class="hint" id="summaryMonthLabel" style="margin-bottom:14px; display:block;"></div>
+    <div class="recurring-list" id="summaryList"></div>
+    <div class="modal-actions">
+      <button type="button" class="ghost" id="closeSummary">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Account Modal -->
+<div class="overlay" id="accountOverlay">
+  <div class="modal">
+    <h2>Account &amp; sync</h2>
+    <div class="hint" id="accountStatus" style="margin-bottom:14px; display:block;"></div>
+
+    <div id="configSection">
+      <div class="field">
+        <label for="fbConfigInput">Firebase config <span class="hint">— paste once on this device, from your Firebase console</span></label>
+        <textarea id="fbConfigInput" rows="4" placeholder='{ apiKey: "...", authDomain: "...", projectId: "...", storageBucket: "...", messagingSenderId: "...", appId: "..." }'></textarea>
+      </div>
+      <div class="field-error" id="configError"></div>
+      <div class="modal-actions">
+        <button type="button" class="income-btn" id="saveConfigBtn">Save config</button>
+      </div>
+    </div>
+
+    <div id="authSection" style="display:none;">
+      <div class="field">
+        <label for="authEmail">Email</label>
+        <input type="email" id="authEmail" placeholder="you@example.com" autocomplete="username">
+      </div>
+      <div class="field">
+        <label for="authPassword">Password</label>
+        <input type="password" id="authPassword" placeholder="At least 6 characters" autocomplete="current-password">
+      </div>
+      <div class="field-error" id="authError"></div>
+      <div class="modal-actions">
+        <button type="button" class="ghost small" id="changeConfigBtn">Change config</button>
+        <button type="button" class="ghost" id="signUpBtn">Create account</button>
+        <button type="button" class="income-btn" id="logInBtn">Log in</button>
+      </div>
+    </div>
+
+    <div id="loggedInSection" style="display:none;">
+      <div class="modal-actions">
+        <button type="button" class="ghost" id="logOutBtn">Log out</button>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="ghost" id="closeAccountModal">Close</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -968,6 +1033,13 @@
   let selectedCategoryType = 'expense';
   let editingExpenseId = null;
   let editingIncomeId = null;
+  let fbConfig = null;
+  let firebaseApp = null;
+  let auth = null;
+  let db = null;
+  let currentUser = null;
+  let unsubscribeSnapshot = null;
+  let suppressNextRemoteEcho = false;
 
   const FREQ_LABEL = {
     weekly: 'Weekly',
@@ -1101,6 +1173,7 @@
       console.error('Could not save data', e);
       showToast('Could not save — your browser storage may be full or blocked.');
     }
+    pushSync();
   }
 
   let toastTimer;
@@ -1111,6 +1184,225 @@
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
   }
+
+  // ---- Cloud sync (optional — via the user's own free Firebase project) ----
+  function loadAccountSettings(){
+    try{
+      const cfgRaw = localStorage.getItem('ledger-fb-config');
+      if(cfgRaw){
+        fbConfig = JSON.parse(cfgRaw);
+        initFirebase();
+      }
+    }catch(e){ console.error('Could not load account config', e); }
+  }
+  function initFirebase(){
+    if(!fbConfig) return false;
+    try{
+      if(!firebaseApp){
+        firebaseApp = firebase.initializeApp(fbConfig);
+        auth = firebase.auth();
+        db = firebase.firestore();
+        auth.onAuthStateChanged((user) => {
+          currentUser = user;
+          if(user){
+            attachRealtimeSync(user.uid);
+          } else {
+            detachRealtimeSync();
+          }
+          updateAccountUI();
+        });
+      }
+      return true;
+    }catch(e){
+      console.error('Firebase init failed', e);
+      auth = null; db = null;
+      return false;
+    }
+  }
+  function hasAnyData(){
+    return data.categories.length > 0 || data.expenses.length > 0 || data.income.length > 0;
+  }
+  async function pushSync(){
+    if(!db || !currentUser) return;
+    try{
+      suppressNextRemoteEcho = true;
+      await db.collection('users').doc(currentUser.uid).set({ payload: JSON.stringify(data), updatedAt: Date.now() });
+    }catch(e){
+      console.error('Sync push failed', e);
+      showToast('Saved on this device, but could not reach the cloud to sync.');
+    }
+  }
+  function attachRealtimeSync(uid){
+    detachRealtimeSync();
+    unsubscribeSnapshot = db.collection('users').doc(uid).onSnapshot((doc) => {
+      if(suppressNextRemoteEcho){ suppressNextRemoteEcho = false; return; }
+      if(doc.exists && doc.data().payload){
+        const remote = JSON.parse(doc.data().payload);
+        data.categories = (remote.categories || []).map(c => ({ notes: [], type: 'expense', ...c }));
+        data.expenses = remote.expenses || [];
+        data.recurring = remote.recurring || [];
+        data.income = remote.income || [];
+        data.recurringIncome = remote.recurringIncome || [];
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+        generateDueExpenses();
+        generateDueIncome();
+        render();
+        showToast('Updated from another device.');
+      }
+    }, (err) => console.error('Realtime sync error', err));
+  }
+  function detachRealtimeSync(){
+    if(unsubscribeSnapshot){ unsubscribeSnapshot(); unsubscribeSnapshot = null; }
+  }
+  async function pullOnce(uid){
+    const doc = await db.collection('users').doc(uid).get();
+    if(doc.exists && doc.data().payload){
+      const remote = JSON.parse(doc.data().payload);
+      data.categories = (remote.categories || []).map(c => ({ notes: [], type: 'expense', ...c }));
+      data.expenses = remote.expenses || [];
+      data.recurring = remote.recurring || [];
+      data.income = remote.income || [];
+      data.recurringIncome = remote.recurringIncome || [];
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      return true;
+    }
+    return false;
+  }
+  function authErrorMessage(e){
+    const map = {
+      'auth/email-already-in-use': 'An account with that email already exists — try logging in instead.',
+      'auth/invalid-email': 'That email address doesn\'t look right.',
+      'auth/weak-password': 'Password should be at least 6 characters.',
+      'auth/wrong-password': 'Incorrect password.',
+      'auth/user-not-found': 'No account found with that email.',
+      'auth/invalid-credential': 'Incorrect email or password.',
+      'auth/too-many-requests': 'Too many attempts — please wait a bit and try again.'
+    };
+    return map[e.code] || e.message || 'Something went wrong.';
+  }
+
+  function updateAccountUI(){
+    const statusEl = document.getElementById('accountStatus');
+    const configSection = document.getElementById('configSection');
+    const authSection = document.getElementById('authSection');
+    const loggedInSection = document.getElementById('loggedInSection');
+
+    if(!fbConfig){
+      statusEl.textContent = 'Set up cloud sync once on this device to enable accounts.';
+      configSection.style.display = 'block';
+      authSection.style.display = 'none';
+      loggedInSection.style.display = 'none';
+    } else if(!currentUser){
+      statusEl.textContent = 'Log in or create an account to sync across your devices.';
+      configSection.style.display = 'none';
+      authSection.style.display = 'block';
+      loggedInSection.style.display = 'none';
+    } else {
+      statusEl.innerHTML = `Logged in as <strong>${escapeHtml(currentUser.email)}</strong> — this device stays in sync automatically.`;
+      configSection.style.display = 'none';
+      authSection.style.display = 'none';
+      loggedInSection.style.display = 'block';
+    }
+  }
+
+  const accountOverlay = document.getElementById('accountOverlay');
+  const configError = document.getElementById('configError');
+  const authError = document.getElementById('authError');
+
+  document.getElementById('openAccountModal').addEventListener('click', () => {
+    configError.textContent = '';
+    authError.textContent = '';
+    document.getElementById('fbConfigInput').value = fbConfig ? JSON.stringify(fbConfig) : '';
+    updateAccountUI();
+    accountOverlay.classList.add('open');
+  });
+  document.getElementById('closeAccountModal').addEventListener('click', () => accountOverlay.classList.remove('open'));
+  accountOverlay.addEventListener('click', (e) => { if(e.target === accountOverlay) accountOverlay.classList.remove('open'); });
+
+  document.getElementById('saveConfigBtn').addEventListener('click', () => {
+    configError.textContent = '';
+    const raw = document.getElementById('fbConfigInput').value.trim();
+    let parsed;
+    try{
+      parsed = new Function('return (' + raw + ')')();
+      if(!parsed || !parsed.apiKey || !parsed.projectId) throw new Error('missing fields');
+    }catch(e){
+      configError.textContent = 'Could not read that config — paste the full object from your Firebase console.';
+      return;
+    }
+    fbConfig = parsed;
+    localStorage.setItem('ledger-fb-config', JSON.stringify(fbConfig));
+    if(!initFirebase()){
+      configError.textContent = 'Could not connect to Firebase with that config.';
+      fbConfig = null;
+      localStorage.removeItem('ledger-fb-config');
+      return;
+    }
+    updateAccountUI();
+  });
+
+  document.getElementById('changeConfigBtn').addEventListener('click', () => {
+    if(!confirm('Change the Firebase config on this device? You\'ll need to log in again afterward.')) return;
+    if(auth) auth.signOut();
+    fbConfig = null; firebaseApp = null; auth = null; db = null; currentUser = null;
+    localStorage.removeItem('ledger-fb-config');
+    document.getElementById('fbConfigInput').value = '';
+    updateAccountUI();
+  });
+
+  document.getElementById('signUpBtn').addEventListener('click', async () => {
+    authError.textContent = '';
+    const email = document.getElementById('authEmail').value.trim();
+    const password = document.getElementById('authPassword').value;
+    if(!email || password.length < 6){
+      authError.textContent = 'Enter an email and a password of at least 6 characters.';
+      return;
+    }
+    try{
+      const localHadData = hasAnyData();
+      const cred = await auth.createUserWithEmailAndPassword(email, password);
+      if(localHadData){
+        await pushSync(); // seed the new account with whatever was already on this device
+      }
+      showToast('Account created — you\'re synced.');
+      accountOverlay.classList.remove('open');
+    }catch(e){
+      console.error('Sign up failed', e);
+      authError.textContent = authErrorMessage(e);
+    }
+  });
+
+  document.getElementById('logInBtn').addEventListener('click', async () => {
+    authError.textContent = '';
+    const email = document.getElementById('authEmail').value.trim();
+    const password = document.getElementById('authPassword').value;
+    if(!email || !password){
+      authError.textContent = 'Enter your email and password.';
+      return;
+    }
+    try{
+      if(hasAnyData() && !confirm('Logging in will replace this device\'s data with your account\'s synced data. Continue?')){
+        return;
+      }
+      const cred = await auth.signInWithEmailAndPassword(email, password);
+      await pullOnce(cred.user.uid);
+      generateDueExpenses();
+      generateDueIncome();
+      render();
+      showToast('Logged in — this device is now synced.');
+      accountOverlay.classList.remove('open');
+    }catch(e){
+      console.error('Log in failed', e);
+      authError.textContent = authErrorMessage(e);
+    }
+  });
+
+  document.getElementById('logOutBtn').addEventListener('click', () => {
+    if(!confirm('Log out on this device? Your data stays saved in the cloud and on this device.')) return;
+    auth.signOut();
+    showToast('Logged out on this device.');
+    accountOverlay.classList.remove('open');
+  });
 
   // ---- recurring generation ----
   function generateDueExpenses(){
@@ -1381,6 +1673,88 @@
     }
   }
 
+  function renderSummary(){
+    document.getElementById('summaryMonthLabel').textContent = `Breakdown for ${monthLabel(currentMonth)}`;
+    const expenseCats = data.categories.filter(c => c.type === 'expense');
+    const rows = expenseCats.map(cat => ({
+      name: cat.name,
+      spent: entriesForCategoryMonth(data.expenses, cat.id, currentMonth).reduce((s,e) => s + e.amount, 0)
+    })).filter(r => r.spent > 0).sort((a,b) => b.spent - a.spent);
+
+    const list = document.getElementById('summaryList');
+    if(rows.length === 0){
+      list.innerHTML = '<div class="no-entries">No spending logged this month yet.</div>';
+      return;
+    }
+    const total = rows.reduce((s,r) => s + r.spent, 0);
+    list.innerHTML = rows.map(r => {
+      const pct = total > 0 ? (r.spent / total) * 100 : 0;
+      return `
+        <div class="recurring-item">
+          <div class="ri-main" style="width:100%;">
+            <div class="ri-cat">${escapeHtml(r.name)} — ${fmt(r.spent)}</div>
+            <div class="ruler" style="margin-top:7px;"><div class="ruler-fill" style="width:${pct}%"></div></div>
+            <div class="ri-meta" style="margin-top:5px;">${pct.toFixed(1)}% of total spending</div>
+          </div>
+        </div>
+      `;
+    }).join('') + `<div class="ri-meta" style="text-align:right; margin-top:4px; font-weight:600;">Total spent: ${fmt(total)}</div>`;
+  }
+
+  const summaryOverlay = document.getElementById('summaryOverlay');
+  document.getElementById('openSummaryModal').addEventListener('click', () => {
+    renderSummary();
+    summaryOverlay.classList.add('open');
+  });
+  document.getElementById('closeSummary').addEventListener('click', () => summaryOverlay.classList.remove('open'));
+  summaryOverlay.addEventListener('click', (e) => { if(e.target === summaryOverlay) summaryOverlay.classList.remove('open'); });
+
+  // ---------- Excel export (current month) ----------
+  function catName(id){
+    const cat = data.categories.find(c => c.id === id);
+    return cat ? cat.name : 'Uncategorized';
+  }
+  function exportExcel(){
+    if(typeof XLSX === 'undefined'){
+      showToast('Excel export library did not load — check your connection and try again.');
+      return;
+    }
+    const monthExpenses = data.expenses.filter(e => monthOf(e.date) === currentMonth).sort((a,b) => a.date.localeCompare(b.date));
+    const monthIncome = data.income.filter(i => monthOf(i.date) === currentMonth).sort((a,b) => a.date.localeCompare(b.date));
+
+    const expenseRows = monthExpenses.length
+      ? monthExpenses.map(e => ({ Date: e.date, Category: catName(e.categoryId), Note: e.note || '', Details: e.details || '', Amount: e.amount }))
+      : [{ Date: '', Category: '', Note: 'No expenses logged this month', Details: '', Amount: '' }];
+
+    const incomeRows = monthIncome.length
+      ? monthIncome.map(i => ({ Date: i.date, Category: catName(i.categoryId), Note: i.note || '', Amount: i.amount }))
+      : [{ Date: '', Category: '', Note: 'No income logged this month', Amount: '' }];
+
+    const expenseCats = data.categories.filter(c => c.type === 'expense');
+    const catTotals = expenseCats.map(cat => ({
+      name: cat.name,
+      spent: entriesForCategoryMonth(data.expenses, cat.id, currentMonth).reduce((s,e) => s + e.amount, 0)
+    })).filter(r => r.spent > 0).sort((a,b) => b.spent - a.spent);
+    const totalSpent = catTotals.reduce((s,r) => s + r.spent, 0);
+    const totalIncome = monthIncome.reduce((s,i) => s + i.amount, 0);
+
+    const summaryRows = catTotals.length
+      ? catTotals.map(r => ({ Category: r.name, Amount: r.spent, '% of Spending': totalSpent > 0 ? Number(((r.spent/totalSpent)*100).toFixed(1)) : 0 }))
+      : [{ Category: 'No spending logged this month', Amount: '', '% of Spending': '' }];
+    summaryRows.push({ Category: 'TOTAL SPENT', Amount: totalSpent, '% of Spending': '' });
+    summaryRows.push({ Category: 'TOTAL INCOME', Amount: totalIncome, '% of Spending': '' });
+    summaryRows.push({ Category: 'NET (income − spent)', Amount: totalIncome - totalSpent, '% of Spending': '' });
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), 'Summary');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(expenseRows), 'Expenses');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(incomeRows), 'Income');
+
+    const filename = `Ledger-${monthLabel(currentMonth).replace(' ', '-')}.xlsx`;
+    XLSX.writeFile(wb, filename);
+  }
+  document.getElementById('exportExcelBtn').addEventListener('click', exportExcel);
+
   // ---------- Category modal ----------
   const categoryOverlay = document.getElementById('categoryOverlay');
   const categoryForm = document.getElementById('categoryForm');
@@ -1545,8 +1919,8 @@
       document.getElementById('expenseModalTitle').textContent = 'Log an expense';
       document.getElementById('saveExpenseBtn').textContent = 'Save expense';
       expenseDateInput.value = todayISO();
-      expenseDateInput.disabled = true;
-      expenseDateHint.textContent = 'Added automatically';
+      expenseDateInput.disabled = false;
+      expenseDateHint.textContent = 'Defaults to today — change it if needed.';
       expenseRecurringRow.style.display = 'flex';
       recurringToggle.checked = false;
     }
@@ -1680,8 +2054,8 @@
       document.getElementById('incomeModalTitle').textContent = 'Log income';
       document.getElementById('saveIncomeBtn').textContent = 'Save income';
       incomeDateInput.value = todayISO();
-      incomeDateInput.disabled = true;
-      incomeDateHint.textContent = 'Added automatically';
+      incomeDateInput.disabled = false;
+      incomeDateHint.textContent = 'Defaults to today — change it if needed.';
       incomeRecurringRow.style.display = 'flex';
       incomeRecurringToggle.checked = false;
     }
@@ -1877,6 +2251,7 @@
   (function init(){
     setTodayLabel();
     loadData();
+    loadAccountSettings();
     generateDueExpenses();
     generateDueIncome();
     render();
